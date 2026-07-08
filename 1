@@ -1,0 +1,82 @@
+import os
+import subprocess
+import re
+from flask import Flask, Response, send_file
+
+app = Flask(__name__)
+ORIGINAL_M3U = "zirve.m3u"
+OUTPUT_M3U = "zirvedekode.m3u"
+
+def get_cloudflare_url():
+    process = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", "http://localhost:5000"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    print("--- Tunnel qurulur, lütfən gözləyin... ---")
+    while True:
+        line = process.stderr.readline()
+        if "trycloudflare.com" in line:
+            url = re.search(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com", line)
+            if url: return url.group(0)
+
+def generate_m3u(base_url):
+    with open(ORIGINAL_M3U, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
+        for line in lines:
+            if line.strip().startswith(("http", "udp")):
+                channel_name = lines[lines.index(line)-1].split(',')[-1].strip().replace(" ", "_")
+                f.write(f"{base_url}/{channel_name}.mp4\n")
+            else:
+                f.write(line)
+    print(f"\n--- M3U YARADILDI: {base_url}/zirvedekode.m3u ---\n")
+
+@app.route('/zirvedekode.m3u')
+def serve_m3u():
+    return send_file(OUTPUT_M3U)
+
+@app.route('/<channel_name>.mp4')
+def stream(channel_name):
+    original_url = ""
+    with open(ORIGINAL_M3U, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        for i, line in enumerate(lines):
+            if channel_name.replace("_", " ") in line:
+                original_url = lines[i+1].strip()
+                break
+    
+    if not original_url: return "Kanal tapılmadı", 404
+
+    # Yüksək optimizasiyalı FFmpeg: 360p, 4:3, MP3, 30fps
+    cmd = [
+        "ffmpeg",
+        "-rtbufsize", "256M",
+        "-i", original_url,
+        "-vf", "scale=480:360:force_original_aspect_ratio=decrease,pad=480:360:(ow-iw)/2:(oh-ih)/2,fps=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "libmp3lame", "-ar", "44100", "-b:a", "96k",
+        "-max_muxing_queue_size", "9999",
+        "-f", "mpegts", "pipe:1"
+    ]
+    
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    def generate():
+        try:
+            while True:
+                data = process.stdout.read(1024)
+                if not data: break
+                yield data
+        finally:
+            process.terminate()
+            
+    return Response(generate(), mimetype='video/MP2T')
+
+if __name__ == '__main__':
+    public_url = get_cloudflare_url()
+    if public_url:
+        generate_m3u(public_url)
+        print(f"Server hazırdır! Pleyer linki: {public_url}/zirvedekode.m3u")
+        app.run(host='0.0.0.0', port=5000)
+
